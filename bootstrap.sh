@@ -27,7 +27,6 @@ port_busy() {
 }
 
 select_first_install_port() {
-  # If the caller explicitly supplied PDA_PORT, respect it exactly.
   if [[ -n "${PDA_PORT:-}" ]]; then
     return 0
   fi
@@ -38,8 +37,6 @@ select_first_install_port() {
     desired="${desired:-8787}"
   fi
 
-  # If Phoenix Dev Agent is already running, this is an update/repair and its
-  # existing published port is expected to be occupied by itself.
   if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq 'phoenix-dev-agent'; then
     export PDA_PORT="$desired"
     return 0
@@ -72,19 +69,30 @@ select_first_install_port() {
 
 select_first_install_port
 
-# GitHub raw responses can be cached briefly. Use a unique query string for
-# bootstrap-critical files so a just-published hotfix cannot resolve to an
-# older manifest or installer.
 CACHE_BUST="$(date +%s)-$$-${RANDOM:-0}"
 
 mf="$(mktemp /tmp/phoenix-dev-manifest.XXXXXX)"
 inst="$(mktemp /tmp/phoenix-dev-installer.XXXXXX.sh)"
 trap 'rm -f "$mf" "$inst"' EXIT
-curl --fail --show-error --location --connect-timeout 15 --retry 3 "$BASE/latest.env?cb=$CACHE_BUST" -o "$mf"
-sha="$(awk -F= '$1=="PDA_INSTALLER_SHA256" {print $2}' "$mf")"
+
+curl --fail --show-error --location --connect-timeout 15 --retry 3 \
+  "$BASE/latest.env?cb=$CACHE_BUST" -o "$mf"
+
+sha="$(awk -F= '$1=="PDA_INSTALLER_SHA256" {print $2; exit}' "$mf")"
+installer_file="$(awk -F= '$1=="PDA_INSTALLER_FILE" {print $2; exit}' "$mf")"
+installer_file="${installer_file:-install-phoenix-dev-agent.sh}"
+
 [[ "$sha" =~ ^[a-fA-F0-9]{64}$ ]] || { echo "ERROR: Invalid installer checksum in release manifest." >&2; exit 1; }
-curl --fail --show-error --location --connect-timeout 15 --retry 3 "$BASE/install-phoenix-dev-agent.sh?cb=$CACHE_BUST" -o "$inst"
+[[ "$installer_file" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ERROR: Invalid installer filename in release manifest." >&2; exit 1; }
+
+curl --fail --show-error --location --connect-timeout 15 --retry 3 \
+  "$BASE/$installer_file?cb=$CACHE_BUST" -o "$inst"
+
 got="$(sha256sum "$inst" | awk '{print $1}')"
-[[ "$got" == "$sha" ]] || { echo "ERROR: Installer checksum mismatch." >&2; exit 1; }
+[[ "$got" == "$sha" ]] || {
+  echo "ERROR: Installer checksum mismatch for $installer_file. Expected $sha, got $got." >&2
+  exit 1
+}
+
 chmod +x "$inst"
 exec env PDA_RELEASE_BASE_URL="$BASE" PDA_PORT="${PDA_PORT:-8787}" bash "$inst" "$ACTION"
