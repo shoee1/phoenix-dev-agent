@@ -1,218 +1,110 @@
 #!/bin/bash
 set -euo pipefail
 
-DEFAULT_RELEASE_BASE_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release"
 BASE="${PDA_BASE:-/mnt/user/appdata/phoenix-dev-agent}"
 WORKSPACE="${PDA_WORKSPACE:-/mnt/user/dev/phoenix-projects}"
-PORT="${PDA_PORT:-8787}"
-NETWORK="phoenix-dev-net"
-AGENT_CONTAINER="phoenix-dev-agent"
-BROKER_CONTAINER="phoenix-dev-broker"
-ENVFILE="$BASE/config/phoenix.env"
-CHANNELFILE="$BASE/config/release-channel.env"
-BIN="$BASE/bin/phoenix-dev"
-RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-}"
-VERSION=""
-PAYLOAD_PARTS=""
-PAYLOAD_SHA256=""
-PAYLOAD_ENCODING=""
-RUNTIME=""
-AGENT_IMAGE=""
-BROKER_IMAGE=""
+VERSION="1.0.7"
+GENERIC_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/9966cc18c34743addd2bc3f32f7a9c97ce770dd2/release/install-phoenix-dev-agent.sh"
+GENERIC_SHA256="11973de5a064a47bdd41b526f65f6aa349e433563805f77147de57f5ffa23ebc"
+ACTION="${1:-install}"
+TMP="$(mktemp /tmp/phoenix-dev-v107-base.XXXXXX.sh)"
+trap 'rm -f "$TMP"' EXIT
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-have() { command -v "$1" >/dev/null 2>&1; }
 
-secret() {
-  if have openssl; then openssl rand -hex 24
-  else tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48
-  fi
-}
+for c in docker curl sha256sum awk python3; do
+  command -v "$c" >/dev/null 2>&1 || die "$c is required."
+done
 
-require_host() {
-  [[ "$(id -u)" -eq 0 ]] || die "Run this installer as root from the Unraid terminal."
-  for c in docker curl tar sha256sum awk sed grep jq base64; do have "$c" || die "$c is required."; done
-  docker info >/dev/null 2>&1 || die "Docker daemon is not available."
-}
+log "Fetching verified Phoenix Dev Agent base installer"
+curl --fail --show-error --location --connect-timeout 15 --retry 3 \
+  "$GENERIC_URL?cb=$(date +%s%N 2>/dev/null || date +%s)" -o "$TMP"
+got="$(sha256sum "$TMP" | awk '{print $1}')"
+[[ "$got" == "$GENERIC_SHA256" ]] || die "Base installer checksum mismatch. Expected $GENERIC_SHA256, got $got."
+chmod +x "$TMP"
 
-resolve_release_base() {
-  if [[ -z "$RELEASE_BASE_URL" && -f "$CHANNELFILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CHANNELFILE"
-    RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-}"
-  fi
-  if [[ -z "$RELEASE_BASE_URL" ]]; then
-    RELEASE_BASE_URL="$DEFAULT_RELEASE_BASE_URL"
-  fi
-  [[ -n "$RELEASE_BASE_URL" ]] || die "No Phoenix release channel is configured. Set PDA_RELEASE_BASE_URL to the hosted release directory."
-  RELEASE_BASE_URL="${RELEASE_BASE_URL%/}"
-  [[ "$RELEASE_BASE_URL" == https://* || "$RELEASE_BASE_URL" == http://* ]] || die "Release URL must be http(s)."
-}
+# The verified v1.0.6 installer is release-manifest driven. With latest.env at
+# v1.0.7 it safely stages/builds the v1.0.7 runtime first, including rollback.
+env PDA_RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release}" \
+    PDA_PORT="${PDA_PORT:-8787}" \
+    bash "$TMP" "$ACTION"
 
-load_manifest() {
-  local mf
-  mf="$(mktemp /tmp/phoenix-dev-manifest.XXXXXX)"
-  log "Pulling release manifest"
-  local cache_bust
-  cache_bust="$(date +%s%N 2>/dev/null || date +%s)"
-  curl --fail --show-error --location --connect-timeout 15 --retry 3 \
-    "$RELEASE_BASE_URL/latest.env?cb=$cache_bust" -o "$mf"
+# Non-install commands are fully handled by the base installer.
+case "$ACTION" in
+  install|update|repair) ;;
+  *) exit 0 ;;
+esac
 
-  local key value
-  while IFS='=' read -r key value; do
-    case "$key" in
-      PDA_RELEASE_VERSION) VERSION="$value" ;;
-      PDA_PAYLOAD_PARTS) PAYLOAD_PARTS="$value" ;;
-      PDA_PAYLOAD_SHA256) PAYLOAD_SHA256="$value" ;;
-      PDA_PAYLOAD_ENCODING) PAYLOAD_ENCODING="$value" ;;
-    esac
-  done < "$mf"
-  rm -f "$mf"
+RUNTIME="$BASE/runtime/$VERSION"
+MAIN="$RUNTIME/agent/main.py"
+ENVFILE="$BASE/config/phoenix.env"
+[[ -f "$MAIN" ]] || die "v$VERSION agent source not found at $MAIN"
+[[ -f "$ENVFILE" ]] || die "Phoenix environment file not found at $ENVFILE"
 
-  [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]] || die "Invalid release version in manifest."
-  [[ -n "$PAYLOAD_PARTS" ]] || die "Missing payload parts in manifest."
-  [[ "$PAYLOAD_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || die "Invalid payload SHA-256 in manifest."
-  [[ "$PAYLOAD_ENCODING" == "base64" ]] || die "Unsupported payload encoding in manifest."
+log "Applying verified Codex compatibility hotfix for codex-cli 0.154.x"
+PDA_RELEASE_VERSION="$VERSION" python3 - "$MAIN" <<'PY'
+from pathlib import Path
+import os, re, sys
 
-  RUNTIME="$BASE/runtime/$VERSION"
-  AGENT_IMAGE="phoenix-dev-agent:$VERSION"
-  BROKER_IMAGE="phoenix-dev-broker:$VERSION"
-}
+p = Path(sys.argv[1])
+s = p.read_text()
+version = os.environ["PDA_RELEASE_VERSION"]
 
-save_channel() {
-  mkdir -p "$BASE/config"
-  cat > "$CHANNELFILE" <<EOF2
-PDA_RELEASE_BASE_URL=$RELEASE_BASE_URL
-EOF2
-  chmod 600 "$CHANNELFILE"
-}
+old_cmd = '    cmd=["codex","exec","--json","-C",str(ws)]'
+new_cmd = '    cmd=["codex","exec","--json","--skip-git-repo-check","-C",str(ws)]'
+old_auto = '    if full_auto: cmd.append("--full-auto")'
+new_auto = '    if full_auto: cmd.extend(["--sandbox","read-only"])'
 
-download_payload() {
-  local payload_encoded payload_tmp got
-  payload_encoded="$(mktemp /tmp/phoenix-dev-payload.XXXXXX.b64)"
-  payload_tmp="$(mktemp /tmp/phoenix-dev-payload.XXXXXX.tgz)"
-  log "Downloading Phoenix Dev Agent v$VERSION payload"
-  : > "$payload_encoded"
-  IFS=';' read -r -a parts <<< "$PAYLOAD_PARTS"
-  local part
-  for part in "${parts[@]}"; do
-    [[ "$part" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid payload part name: $part"
-    curl --fail --show-error --location --connect-timeout 15 --retry 3 \
-      "$RELEASE_BASE_URL/$part" >> "$payload_encoded"
-  done
-  base64 -d "$payload_encoded" > "$payload_tmp" || die "Unable to decode release payload."
-  rm -f "$payload_encoded"
-  got="$(sha256sum "$payload_tmp" | awk '{print $1}')"
-  [[ "$got" == "$PAYLOAD_SHA256" ]] || die "Payload checksum mismatch. Expected $PAYLOAD_SHA256, got $got."
+if old_cmd in s:
+    s = s.replace(old_cmd, new_cmd, 1)
+elif new_cmd not in s:
+    raise SystemExit("Expected Codex command construction was not found")
 
-  rm -rf "$RUNTIME"
-  mkdir -p "$RUNTIME"
-  tar -xzf "$payload_tmp" -C "$RUNTIME"
-  rm -f "$payload_tmp"
+if old_auto in s:
+    s = s.replace(old_auto, new_auto, 1)
+elif new_auto not in s:
+    raise SystemExit("Expected Codex automation flag construction was not found")
 
-  chmod +x "$RUNTIME/phoenix-dev"
-  mkdir -p "$BASE/bin"
-  cp -f "$RUNTIME/phoenix-dev" "$BIN"
-  chmod +x "$BIN"
-  ln -sf "$BIN" /usr/local/bin/phoenix-dev 2>/dev/null || true
-}
+# v1.0.6 reports 1.0.0 from its health endpoint. Correct dictionary-style
+# version fields while leaving unrelated text untouched.
+s, count = re.subn(
+    r'([\"\']version[\"\']\s*:\s*[\"\'])1\.0\.0([\"\'])',
+    lambda m: m.group(1) + version + m.group(2),
+    s,
+)
+if count == 0 and version not in s:
+    raise SystemExit("Expected stale agent version field was not found")
 
-ensure_config() {
-  mkdir -p "$BASE/config" "$BASE/projects" "$BASE/incidents" "$BASE/logs" "$BASE/codex" "$BASE/backups" "$BASE/releases" "$WORKSPACE"
-  if [[ ! -f "$ENVFILE" ]]; then
-    local admin_pass broker_token
-    admin_pass="$(secret)"
-    broker_token="$(secret)"
-    cat > "$ENVFILE" <<EOF2
-PDA_ADMIN_USER=admin
-PDA_ADMIN_PASSWORD=$admin_pass
-BROKER_TOKEN=$broker_token
-PDA_PORT=$PORT
-DEV_SWEEP_SECONDS=600
-FAST_WATCH_SECONDS=60
-CODEX_MODEL=
-EOF2
-    chmod 600 "$ENVFILE"
-  fi
-  set -a
-  # shellcheck source=/dev/null
-  source "$ENVFILE"
-  set +a
-  PORT="${PDA_PORT:-$PORT}"
-}
+p.write_text(s)
+print(f"Patched {p}")
+PY
 
-port_busy() {
-  local p="$1"
-  if docker ps --format '{{.Ports}}' 2>/dev/null | grep -Fq ":${p}->"; then return 0; fi
-  if have ss && ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${p}$"; then return 0; fi
-  return 1
-}
+python3 -m py_compile "$MAIN" || die "Patched agent source failed Python compilation."
 
-agent_owns_port() {
-  local p="$1"
-  docker ps --filter "name=^/${AGENT_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -Fxq "$AGENT_CONTAINER" || return 1
-  docker port "$AGENT_CONTAINER" 8787/tcp 2>/dev/null | grep -Eq ":${p}$"
-}
+echo "===== PATCH VERIFICATION ====="
+grep -n -E 'codex.*exec|full_auto|version.*1\.0\.7' "$MAIN" | head -20 || true
 
-ensure_ui_port() {
-  if ! port_busy "$PORT" || agent_owns_port "$PORT"; then return 0; fi
-  local old="$PORT" candidate
-  for candidate in $(seq 8788 8899); do
-    if ! port_busy "$candidate"; then
-      PORT="$candidate"
-      export PDA_PORT="$candidate"
-      if grep -q '^PDA_PORT=' "$ENVFILE"; then
-        sed -i "s/^PDA_PORT=.*/PDA_PORT=$candidate/" "$ENVFILE"
-      else
-        printf '\nPDA_PORT=%s\n' "$candidate" >> "$ENVFILE"
-      fi
-      echo "Port $old is already in use; Phoenix Dev Agent will use port $candidate instead."
-      return 0
-    fi
-  done
-  die "No free Phoenix Dev Agent UI port found in 8787-8899."
-}
+# Rebuild the agent image from the patched runtime. Keep the broker created by
+# the base installer; only the agent needs replacing.
+log "Rebuilding patched Phoenix Dev Agent v$VERSION image"
+old_image_id="$(docker inspect -f '{{.Image}}' phoenix-dev-agent 2>/dev/null || true)"
+docker build --pull --no-cache -t "phoenix-dev-agent:$VERSION" "$RUNTIME/agent"
 
-build_images() {
-  log "Building Phoenix Dev Agent $VERSION"
-  docker build --pull --no-cache -t "$BROKER_IMAGE" "$RUNTIME/broker"
-  docker build --pull --no-cache -t "$AGENT_IMAGE" "$RUNTIME/agent"
+set -a
+# shellcheck source=/dev/null
+source "$ENVFILE"
+set +a
+PORT="${PDA_PORT:-8787}"
 
-  log "Verifying built broker image contains Docker CLI"
-  docker run --rm --entrypoint /bin/sh "$BROKER_IMAGE" -lc \
-    'test -x /usr/bin/docker && /usr/bin/docker --version' >/dev/null \
-    || die "Broker image validation failed: Docker CLI is missing or unusable."
-}
-
-remove_stack() {
-  docker rm -f "$AGENT_CONTAINER" >/dev/null 2>&1 || true
-  docker rm -f "$BROKER_CONTAINER" >/dev/null 2>&1 || true
-}
-
-start_stack() {
-  local agent_image="$1" broker_image="$2"
-  docker network inspect "$NETWORK" >/dev/null 2>&1 || docker network create "$NETWORK" >/dev/null
-
+run_agent() {
+  local image="$1"
   docker run -d \
-    --name "$BROKER_CONTAINER" \
+    --name phoenix-dev-agent \
     --restart unless-stopped \
-    --network "$NETWORK" \
-    -e "BROKER_TOKEN=$BROKER_TOKEN" \
-    -e "PDA_DATA=/data" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "$BASE:/data:rw" \
-    -v /mnt/user:/host/user:ro \
-    -v /mnt/user/appdata:/host/appdata:ro \
-    -v "$WORKSPACE:/host/workspace:rw" \
-    "$broker_image" >/dev/null
-
-  docker run -d \
-    --name "$AGENT_CONTAINER" \
-    --restart unless-stopped \
-    --network "$NETWORK" \
+    --network phoenix-dev-net \
     -p "$PORT:8787" \
-    -e "BROKER_URL=http://$BROKER_CONTAINER:8790" \
+    -e "BROKER_URL=http://phoenix-dev-broker:8790" \
     -e "BROKER_TOKEN=$BROKER_TOKEN" \
     -e "PDA_ADMIN_USER=$PDA_ADMIN_USER" \
     -e "PDA_ADMIN_PASSWORD=$PDA_ADMIN_PASSWORD" \
@@ -224,195 +116,51 @@ start_stack() {
     -v "$BASE:/data:rw" \
     -v "$WORKSPACE:/workspace:rw" \
     -v "$BASE/codex:/root/.codex:rw" \
-    "$agent_image" >/dev/null
+    "$image" >/dev/null
 }
 
-wait_healthy() {
-  local i
-  for i in $(seq 1 45); do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then return 0; fi
-    sleep 1
-  done
-  return 1
-}
-
-install_or_update() {
-  require_host
-  resolve_release_base
-  mkdir -p "$BASE" "$WORKSPACE"
-  load_manifest
-  download_payload
-  ensure_config
-  save_channel
-
-  ensure_ui_port
-
-  local old_agent="" old_broker="" old_healthy=0
-  old_agent="$(docker inspect -f '{{.Config.Image}}' "$AGENT_CONTAINER" 2>/dev/null || true)"
-  old_broker="$(docker inspect -f '{{.Config.Image}}' "$BROKER_CONTAINER" 2>/dev/null || true)"
-  if [[ -n "$old_agent" && -n "$old_broker" ]] \
-     && [[ "$(docker inspect -f '{{.State.Running}}' "$AGENT_CONTAINER" 2>/dev/null || true)" == "true" ]] \
-     && [[ "$(docker inspect -f '{{.State.Running}}' "$BROKER_CONTAINER" 2>/dev/null || true)" == "true" ]] \
-     && "$BIN" status >/dev/null 2>&1; then
-    old_healthy=1
+log "Restarting agent with the patched v$VERSION image"
+docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
+if ! run_agent "phoenix-dev-agent:$VERSION"; then
+  if [[ -n "$old_image_id" ]]; then
+    echo "Patched agent failed to start; restoring prior agent image."
+    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
+    run_agent "$old_image_id" || true
   fi
+  die "Unable to start patched Phoenix Dev Agent."
+fi
 
-  build_images
-
-  log "Starting Phoenix Dev Agent v$VERSION"
-  remove_stack
-  if ! start_stack "$AGENT_IMAGE" "$BROKER_IMAGE"; then
-    if [[ "$old_healthy" -eq 1 ]]; then
-      echo "New stack failed to start; restoring verified healthy previous Phoenix Dev Agent images."
-      remove_stack
-      start_stack "$old_agent" "$old_broker" || true
-    else
-      echo "No verified healthy previous Phoenix Dev Agent stack is available for rollback."
-    fi
-    die "Failed to start new Phoenix Dev Agent stack."
+healthy=0
+for _ in $(seq 1 45); do
+  if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    healthy=1
+    break
   fi
+  sleep 1
+done
 
-  if ! wait_healthy; then
-    echo "Health check failed."
-    docker logs --tail 120 "$AGENT_CONTAINER" || true
-    if [[ "$old_healthy" -eq 1 ]]; then
-      echo "Rolling Phoenix Dev Agent itself back to the verified healthy previous images."
-      remove_stack
-      start_stack "$old_agent" "$old_broker" || true
-    else
-      echo "No verified healthy previous Phoenix Dev Agent stack is available for rollback."
-    fi
-    die "Phoenix Dev Agent health check failed."
+if [[ "$healthy" -ne 1 ]]; then
+  echo "Patched agent health check failed. Recent logs:"
+  docker logs --tail 150 phoenix-dev-agent 2>&1 || true
+  if [[ -n "$old_image_id" ]]; then
+    echo "Restoring prior agent image."
+    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
+    run_agent "$old_image_id" || true
   fi
+  die "Patched agent health check failed."
+fi
 
-  log "Validating agent/broker"
-  if ! "$BIN" status >/dev/null; then
-    echo "Agent/broker validation failed. Recent logs follow:"
-    echo "===== AGENT LOG ====="
-    docker logs --tail 150 "$AGENT_CONTAINER" 2>&1 || true
-    echo "===== BROKER LOG ====="
-    docker logs --tail 150 "$BROKER_CONTAINER" 2>&1 || true
-    if [[ "$old_healthy" -eq 1 ]]; then
-      echo "Rolling Phoenix Dev Agent itself back to the verified healthy previous images."
-      remove_stack
-      start_stack "$old_agent" "$old_broker" || true
-    else
-      echo "No verified healthy previous Phoenix Dev Agent stack is available for rollback; failed candidate left running for diagnostics."
-    fi
-    die "Agent/broker validation failed."
+if ! "$BASE/bin/phoenix-dev" status >/dev/null; then
+  echo "Patched agent/broker validation failed. Recent agent logs:"
+  docker logs --tail 150 phoenix-dev-agent 2>&1 || true
+  if [[ -n "$old_image_id" ]]; then
+    echo "Restoring prior agent image."
+    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
+    run_agent "$old_image_id" || true
   fi
+  die "Patched agent/broker validation failed."
+fi
 
-  log "Cleaning orphaned Docker images after successful deployment"
-  docker image prune -f >/dev/null || true
-
-  print_success
-}
-
-print_success() {
-  local ip
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  echo
-  echo "======================================================================"
-  echo " Phoenix Dev Agent v$VERSION is running"
-  echo "======================================================================"
-  echo " UI:       http://${ip:-UNRAID-IP}:$PORT"
-  echo " Username: $PDA_ADMIN_USER"
-  echo " Password: $PDA_ADMIN_PASSWORD"
-  echo " Channel:  $RELEASE_BASE_URL"
-  echo
-  echo " Helper:   $BIN"
-  echo " Update:   phoenix-dev update"
-  echo
-  echo " ONE-TIME CODEX SIGN-IN:"
-  echo "   phoenix-dev codex-login"
-  echo
-  echo " Register ONLY the existing app(s) you deliberately want managed."
-  echo " Unregistered containers are not enrolled as Phoenix projects."
-  echo "======================================================================"
-}
-
-status_cmd() {
-  require_host
-  ensure_config
-  echo "Phoenix Dev Agent"
-  [[ -f "$CHANNELFILE" ]] && { echo -n "Release channel: "; grep '^PDA_RELEASE_BASE_URL=' "$CHANNELFILE" | cut -d= -f2-; }
-  docker ps -a --filter "name=^/${AGENT_CONTAINER}$" --filter "name=^/${BROKER_CONTAINER}$" \
-    --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-  echo
-  curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null || echo "Agent health endpoint unavailable."
-  echo
-  [[ -x "$BIN" ]] && "$BIN" credentials || true
-}
-
-uninstall_cmd() {
-  require_host
-  remove_stack
-  docker network rm "$NETWORK" >/dev/null 2>&1 || true
-  rm -f /usr/local/bin/phoenix-dev 2>/dev/null || true
-  if [[ "${1:-}" == "--purge" ]]; then
-    echo "PURGE requested: deleting Phoenix Dev Agent data and managed workspace."
-    rm -rf "$BASE" "$WORKSPACE"
-  else
-    echo "Containers removed. Data preserved at:"
-    echo "  $BASE"
-    echo "  $WORKSPACE"
-    echo "Run uninstall --purge only if you intentionally want those deleted too."
-  fi
-}
-
-verify_channel_cmd() {
-  for c in curl tar sha256sum awk; do have "$c" || die "$c is required."; done
-  resolve_release_base
-  load_manifest
-  local enc tmp got
-  enc="$(mktemp /tmp/phoenix-dev-verify.XXXXXX.b64)"
-  tmp="$(mktemp /tmp/phoenix-dev-verify.XXXXXX.tgz)"
-  trap "rm -f '$enc' '$tmp'" EXIT
-  : > "$enc"
-  IFS=';' read -r -a parts <<< "$PAYLOAD_PARTS"
-  local part
-  for part in "${parts[@]}"; do
-    [[ "$part" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid payload part name: $part"
-    curl --fail --show-error --location --connect-timeout 15 --retry 3 \
-      "$RELEASE_BASE_URL/$part" >> "$enc"
-  done
-  base64 -d "$enc" > "$tmp" || die "Unable to decode release payload."
-  got="$(sha256sum "$tmp" | awk '{print $1}')"
-  [[ "$got" == "$PAYLOAD_SHA256" ]] || die "Payload checksum mismatch."
-  tar -tzf "$tmp" >/dev/null || die "Payload archive is invalid."
-  echo "Phoenix Dev Agent release channel verified: v$VERSION"
-  echo "Payload SHA-256: $got"
-}
-
-case "${1:-install}" in
-  install|update|repair) install_or_update ;;
-  verify-channel) verify_channel_cmd ;;
-  status) status_cmd ;;
-  uninstall) uninstall_cmd "${2:-}" ;;
-  credentials)
-    ensure_config
-    "$BIN" credentials
-    ;;
-  *)
-    cat <<EOF2
-Phoenix Dev Agent pull installer
-
-Usage:
-  bash install-phoenix-dev-agent.sh install
-  bash install-phoenix-dev-agent.sh update
-  bash install-phoenix-dev-agent.sh repair
-  bash install-phoenix-dev-agent.sh status
-  bash install-phoenix-dev-agent.sh verify-channel
-  bash install-phoenix-dev-agent.sh credentials
-  bash install-phoenix-dev-agent.sh uninstall
-  bash install-phoenix-dev-agent.sh uninstall --purge
-
-First install requires a hosted channel URL unless one is compiled into this script:
-  PDA_RELEASE_BASE_URL=https://host/path/stable bash install-phoenix-dev-agent.sh install
-
-After first install the channel is persisted and future updates are simply:
-  phoenix-dev update
-EOF2
-    exit 2
-    ;;
-esac
+log "Phoenix Dev Agent v$VERSION Codex compatibility hotfix verified"
+docker image prune -f >/dev/null || true
+"$BASE/bin/phoenix-dev" status
