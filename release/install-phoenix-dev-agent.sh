@@ -3,17 +3,17 @@ set -euo pipefail
 
 BASE="${PDA_BASE:-/mnt/user/appdata/phoenix-dev-agent}"
 WORKSPACE="${PDA_WORKSPACE:-/mnt/user/dev/phoenix-projects}"
-VERSION="1.0.7"
+VERSION="1.0.8"
 GENERIC_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/9966cc18c34743addd2bc3f32f7a9c97ce770dd2/release/install-phoenix-dev-agent.sh"
 GENERIC_SHA256="11973de5a064a47bdd41b526f65f6aa349e433563805f77147de57f5ffa23ebc"
 ACTION="${1:-install}"
-TMP="$(mktemp /tmp/phoenix-dev-v107-base.XXXXXX.sh)"
+TMP="$(mktemp /tmp/phoenix-dev-v108-base.XXXXXX.sh)"
 trap 'rm -f "$TMP"' EXIT
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-for c in docker curl sha256sum awk; do
+for c in docker curl sha256sum awk grep sed; do
   command -v "$c" >/dev/null 2>&1 || die "$c is required."
 done
 
@@ -24,13 +24,12 @@ got="$(sha256sum "$TMP" | awk '{print $1}')"
 [[ "$got" == "$GENERIC_SHA256" ]] || die "Base installer checksum mismatch. Expected $GENERIC_SHA256, got $got."
 chmod +x "$TMP"
 
-# The verified v1.0.6 installer is release-manifest driven. With latest.env at
-# v1.0.7 it safely stages/builds the v1.0.7 runtime first, including rollback.
+# Stage/build/start the release through the already-verified v1.0.6 installer.
+# The manifest version is v1.0.8, so its runtime is isolated at runtime/1.0.8.
 env PDA_RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release}" \
     PDA_PORT="${PDA_PORT:-8787}" \
     bash "$TMP" "$ACTION"
 
-# Non-install commands are fully handled by the base installer.
 case "$ACTION" in
   install|update|repair) ;;
   *) exit 0 ;;
@@ -38,47 +37,49 @@ esac
 
 RUNTIME="$BASE/runtime/$VERSION"
 MAIN="$RUNTIME/agent/main.py"
+HELPER_RUNTIME="$RUNTIME/phoenix-dev"
+HELPER_ACTIVE="$BASE/bin/phoenix-dev"
 ENVFILE="$BASE/config/phoenix.env"
+
 [[ -f "$MAIN" ]] || die "v$VERSION agent source not found at $MAIN"
 [[ -f "$ENVFILE" ]] || die "Phoenix environment file not found at $ENVFILE"
 
-log "Applying verified Codex compatibility hotfix for codex-cli 0.154.x"
+log "Applying verified Phoenix v$VERSION source fixes"
 docker run --rm -i \
   -e "PDA_RELEASE_VERSION=$VERSION" \
   -v "$RUNTIME/agent:/src:rw" \
   --entrypoint python \
   "phoenix-dev-agent:$VERSION" - /src/main.py <<'PY'
 from pathlib import Path
-import os, re, sys
+import os, sys
 
 p = Path(sys.argv[1])
 s = p.read_text()
 version = os.environ["PDA_RELEASE_VERSION"]
 
-old_cmd = '    cmd=["codex","exec","--json","-C",str(ws)]'
-new_cmd = '    cmd=["codex","exec","--json","--skip-git-repo-check","-C",str(ws)]'
-old_auto = '    if full_auto: cmd.append("--full-auto")'
-new_auto = '    if full_auto: cmd.extend(["--sandbox","read-only"])'
+replacements = [
+    (
+        'APP_VERSION = "1.0.0"',
+        f'APP_VERSION = "{version}"',
+        "APP_VERSION",
+    ),
+    (
+        '    cmd=["codex","exec","--json","-C",str(ws)]',
+        '    cmd=["codex","exec","--json","--skip-git-repo-check","-C",str(ws)]',
+        "Codex trusted-directory compatibility",
+    ),
+    (
+        '    if full_auto: cmd.append("--full-auto")',
+        '    if full_auto: cmd.extend(["--sandbox","read-only"])',
+        "Codex read-only automation",
+    ),
+]
 
-if old_cmd in s:
-    s = s.replace(old_cmd, new_cmd, 1)
-elif new_cmd not in s:
-    raise SystemExit("Expected Codex command construction was not found")
-
-if old_auto in s:
-    s = s.replace(old_auto, new_auto, 1)
-elif new_auto not in s:
-    raise SystemExit("Expected Codex automation flag construction was not found")
-
-# v1.0.6 reports 1.0.0 from its health endpoint. Correct dictionary-style
-# version fields while leaving unrelated text untouched.
-s, count = re.subn(
-    r'([\"\']version[\"\']\s*:\s*[\"\'])1\.0\.0([\"\'])',
-    lambda m: m.group(1) + version + m.group(2),
-    s,
-)
-if count == 0 and version not in s:
-    raise SystemExit("Expected stale agent version field was not found")
+for old, new, label in replacements:
+    if old in s:
+        s = s.replace(old, new, 1)
+    elif new not in s:
+        raise SystemExit(f"Expected source for {label} was not found")
 
 p.write_text(s)
 print(f"Patched {p}")
@@ -90,13 +91,29 @@ docker run --rm \
   "phoenix-dev-agent:$VERSION" -m py_compile /src/main.py \
   || die "Patched agent source failed Python compilation."
 
-echo "===== PATCH VERIFICATION ====="
-grep -n -E 'codex.*exec|full_auto|version.*1\.0\.7' "$MAIN" | head -20 || true
+# Make future headless sign-ins use device auth. This is convenience-only and
+# does not affect an already-authenticated Codex session.
+for helper in "$HELPER_RUNTIME" "$HELPER_ACTIVE"; do
+  if [[ -f "$helper" ]]; then
+    if grep -Fq 'codex-login) exec docker exec -it phoenix-dev-agent codex login ;;' "$helper"; then
+      sed -i 's#codex-login) exec docker exec -it phoenix-dev-agent codex login ;;#codex-login) exec docker exec -it phoenix-dev-agent codex login --device-auth ;;#' "$helper"
+    fi
+    chmod +x "$helper" || true
+  fi
+done
 
-# Rebuild the agent image from the patched runtime. Keep the broker created by
-# the base installer; only the agent needs replacing.
-log "Rebuilding patched Phoenix Dev Agent v$VERSION image"
-old_image_id="$(docker inspect -f '{{.Image}}' phoenix-dev-agent 2>/dev/null || true)"
+echo "===== PATCH VERIFICATION ====="
+grep -n -E 'APP_VERSION|codex.*exec|full_auto' "$MAIN" | head -20
+
+grep -Fq 'APP_VERSION = "1.0.8"' "$MAIN" \
+  || die "APP_VERSION verification failed."
+grep -Fq 'cmd=["codex","exec","--json","--skip-git-repo-check","-C",str(ws)]' "$MAIN" \
+  || die "Codex command verification failed."
+grep -Fq 'if full_auto: cmd.extend(["--sandbox","read-only"])' "$MAIN" \
+  || die "Codex read-only verification failed."
+
+log "Rebuilding corrected Phoenix Dev Agent v$VERSION image"
+rollback_image_id="$(docker inspect -f '{{.Image}}' phoenix-dev-agent 2>/dev/null || true)"
 docker build --pull --no-cache -t "phoenix-dev-agent:$VERSION" "$RUNTIME/agent"
 
 set -a
@@ -127,15 +144,19 @@ run_agent() {
     "$image" >/dev/null
 }
 
-log "Restarting agent with the patched v$VERSION image"
+restore_base_agent() {
+  if [[ -n "$rollback_image_id" ]]; then
+    echo "Restoring last healthy staged agent image."
+    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
+    run_agent "$rollback_image_id" || true
+  fi
+}
+
+log "Restarting agent with corrected v$VERSION image"
 docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
 if ! run_agent "phoenix-dev-agent:$VERSION"; then
-  if [[ -n "$old_image_id" ]]; then
-    echo "Patched agent failed to start; restoring prior agent image."
-    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
-    run_agent "$old_image_id" || true
-  fi
-  die "Unable to start patched Phoenix Dev Agent."
+  restore_base_agent
+  die "Unable to start corrected Phoenix Dev Agent."
 fi
 
 healthy=0
@@ -148,27 +169,26 @@ for _ in $(seq 1 45); do
 done
 
 if [[ "$healthy" -ne 1 ]]; then
-  echo "Patched agent health check failed. Recent logs:"
+  echo "Corrected agent health check failed. Recent logs:"
   docker logs --tail 150 phoenix-dev-agent 2>&1 || true
-  if [[ -n "$old_image_id" ]]; then
-    echo "Restoring prior agent image."
-    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
-    run_agent "$old_image_id" || true
-  fi
-  die "Patched agent health check failed."
+  restore_base_agent
+  die "Corrected agent health check failed."
 fi
 
-if ! "$BASE/bin/phoenix-dev" status >/dev/null; then
-  echo "Patched agent/broker validation failed. Recent agent logs:"
+status_json="$("$BASE/bin/phoenix-dev" status)" || {
+  echo "Corrected agent/broker validation failed."
   docker logs --tail 150 phoenix-dev-agent 2>&1 || true
-  if [[ -n "$old_image_id" ]]; then
-    echo "Restoring prior agent image."
-    docker rm -f phoenix-dev-agent >/dev/null 2>&1 || true
-    run_agent "$old_image_id" || true
-  fi
-  die "Patched agent/broker validation failed."
-fi
+  restore_base_agent
+  die "Corrected agent/broker validation failed."
+}
 
-log "Phoenix Dev Agent v$VERSION Codex compatibility hotfix verified"
+echo "$status_json" | grep -Fq '"version": "1.0.8"' \
+  || {
+    echo "$status_json"
+    restore_base_agent
+    die "Running agent did not report v1.0.8."
+  }
+
+log "Phoenix Dev Agent v$VERSION verified"
 docker image prune -f >/dev/null || true
-"$BASE/bin/phoenix-dev" status
+echo "$status_json"
