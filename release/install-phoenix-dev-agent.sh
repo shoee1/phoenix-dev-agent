@@ -3,22 +3,28 @@ set -euo pipefail
 
 BASE="${PDA_BASE:-/mnt/user/appdata/phoenix-dev-agent}"
 WORKSPACE="${PDA_WORKSPACE:-/mnt/user/dev/phoenix-projects}"
-VERSION="1.1.1"
+VERSION="1.2.0"
 ACTION="${1:-install}"
+
 GENERIC_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/9966cc18c34743addd2bc3f32f7a9c97ce770dd2/release/install-phoenix-dev-agent.sh"
 GENERIC_SHA256="11973de5a064a47bdd41b526f65f6aa349e433563805f77147de57f5ffa23ebc"
 DISCOVER_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/fcd2e083a3bb17c0a4697f9c1001ecf7d1493ed3/release/features/v1.1.1/phoenix-dev-discover.sh"
 DISCOVER_SHA256="3e4f8b38d0aa36cd805d5b98d71252c58299f8c84fc15034de02baf96b19e7f5"
-WRAPPER_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/4a92b28447b0fe6ea61480b2fb45d7cf02fd6f62/release/features/v1.1.0/phoenix-dev-wrapper.sh"
-WRAPPER_SHA256="5551cee35b02cdef474396604316c87a1c291416da620ce8f7cf6e3032e39e9a"
-TMPBASE="$(mktemp /tmp/phoenix-dev-v111-base.XXXXXX.sh)"
-TMPDISC="$(mktemp /tmp/phoenix-dev-v111-discover.XXXXXX.sh)"
-TMPWRAP="$(mktemp /tmp/phoenix-dev-v111-wrapper.XXXXXX.sh)"
-trap 'rm -f "$TMPBASE" "$TMPDISC" "$TMPWRAP"' EXIT
+ADOPT_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/9a82890857e82828e1b7cd56cd992ae110f4bd50/release/features/v1.2.0/phoenix-dev-adopt.sh"
+ADOPT_SHA256="6cd2d3daa23f031010624ac1874ff1b9c654cc0cff40dfda16cbdde1f66f33da"
+WRAPPER_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/ea8f13fd5346b6a9fb580f0b68436384c2f926ac/release/features/v1.2.0/phoenix-dev-wrapper.sh"
+WRAPPER_SHA256="a3698866eaa99514ef86aff79164a6d1e68f9836e22895a92629f5a3a2524071"
+
+TMPBASE="$(mktemp /tmp/phoenix-dev-v120-base.XXXXXX.sh)"
+TMPDISC="$(mktemp /tmp/phoenix-dev-v120-discover.XXXXXX.sh)"
+TMPADOPT="$(mktemp /tmp/phoenix-dev-v120-adopt.XXXXXX.sh)"
+TMPWRAP="$(mktemp /tmp/phoenix-dev-v120-wrapper.XXXXXX.sh)"
+trap 'rm -f "$TMPBASE" "$TMPDISC" "$TMPADOPT" "$TMPWRAP"' EXIT
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-for c in docker curl sha256sum awk grep sed jq; do
+
+for c in docker curl sha256sum awk grep sed jq git; do
   command -v "$c" >/dev/null 2>&1 || die "$c is required."
 done
 
@@ -35,12 +41,17 @@ PREVIOUS_AGENT_IMAGE_ID="$(docker inspect -f '{{.Image}}' phoenix-dev-agent 2>/d
 
 log "Fetching verified Phoenix base installer"
 fetch_verified "$GENERIC_URL" "$GENERIC_SHA256" "$TMPBASE" "Base installer"
-log "Fetching verified v$VERSION discovery hotfix"
+
+log "Fetching verified project onboarding helpers"
 fetch_verified "$DISCOVER_URL" "$DISCOVER_SHA256" "$TMPDISC" "Discovery helper"
+fetch_verified "$ADOPT_URL" "$ADOPT_SHA256" "$TMPADOPT" "Adoption helper"
 fetch_verified "$WRAPPER_URL" "$WRAPPER_SHA256" "$TMPWRAP" "Command wrapper"
+
 bash -n "$TMPDISC" || die "Discovery helper shell validation failed."
+bash -n "$TMPADOPT" || die "Adoption helper shell validation failed."
 bash -n "$TMPWRAP" || die "Command wrapper shell validation failed."
 "$TMPDISC" --self-test | grep -Fq 'self-test OK' || die "Discovery helper self-test failed."
+"$TMPADOPT" --self-test | grep -Fq 'self-test OK' || die "Adoption helper self-test failed."
 
 env PDA_RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release}" \
     PDA_PORT="${PDA_PORT:-8787}" \
@@ -57,7 +68,9 @@ HELPER_RUNTIME="$RUNTIME/phoenix-dev"
 ENVFILE="$BASE/config/phoenix.env"
 CORE="$BASE/bin/phoenix-dev-core"
 DISCOVER="$BASE/bin/phoenix-dev-discover"
+ADOPT="$BASE/bin/phoenix-dev-adopt"
 ACTIVE="$BASE/bin/phoenix-dev"
+
 [[ -f "$MAIN" ]] || die "v$VERSION agent source not found at $MAIN"
 [[ -f "$HELPER_RUNTIME" ]] || die "v$VERSION helper source not found at $HELPER_RUNTIME"
 [[ -f "$ENVFILE" ]] || die "Phoenix environment file not found at $ENVFILE"
@@ -70,25 +83,30 @@ docker run --rm -i \
   "phoenix-dev-agent:$VERSION" - /src/main.py <<'PY'
 from pathlib import Path
 import os, sys
+
 p = Path(sys.argv[1])
 s = p.read_text()
 version = os.environ["PDA_RELEASE_VERSION"]
+
 if 'APP_VERSION = "1.0.0"' in s:
     s = s.replace('APP_VERSION = "1.0.0"', f'APP_VERSION = "{version}"', 1)
 elif f'APP_VERSION = "{version}"' not in s:
     raise SystemExit("Expected APP_VERSION source was not found")
+
 old_cmd = '    cmd=["codex","exec","--json","-C",str(ws)]'
 new_cmd = '    cmd=["codex","exec","--json","--skip-git-repo-check","-C",str(ws)]'
 if old_cmd in s:
     s = s.replace(old_cmd, new_cmd, 1)
 elif new_cmd not in s:
     raise SystemExit("Expected Codex command source was not found")
+
 old_auto = '    if full_auto: cmd.append("--full-auto")'
 new_auto = '    if full_auto: cmd.extend(["--sandbox","read-only"])'
 if old_auto in s:
     s = s.replace(old_auto, new_auto, 1)
 elif new_auto not in s:
     raise SystemExit("Expected Codex automation source was not found")
+
 p.write_text(s)
 print(f"Patched {p}")
 PY
@@ -110,6 +128,7 @@ fi
 
 log "Rebuilding corrected Phoenix Dev Agent v$VERSION image"
 docker build --pull --no-cache -t "phoenix-dev-agent:$VERSION" "$RUNTIME/agent"
+
 RUNTIME_HASH="$(sha256sum "$MAIN" | awk '{print $1}')"
 IMAGE_HASH="$(docker run --rm --entrypoint sh "phoenix-dev-agent:$VERSION" -lc 'sha256sum /app/main.py' | awk '{print $1}')"
 [[ "$RUNTIME_HASH" == "$IMAGE_HASH" ]] || die "Built agent image does not contain the patched runtime source."
@@ -171,12 +190,15 @@ fi
 
 cp -f "$HELPER_RUNTIME" "$CORE"
 cp -f "$TMPDISC" "$DISCOVER"
+cp -f "$TMPADOPT" "$ADOPT"
 cp -f "$TMPWRAP" "$ACTIVE"
-chmod +x "$CORE" "$DISCOVER" "$ACTIVE"
+chmod +x "$CORE" "$DISCOVER" "$ADOPT" "$ACTIVE"
 ln -sf "$ACTIVE" /usr/local/bin/phoenix-dev 2>/dev/null || true
 
 log "Validating command routing"
 "$ACTIVE" discover --self-test | grep -Fq 'self-test OK' || die "phoenix-dev discover command routing self-test failed."
+"$ACTIVE" adopt --self-test | grep -Fq 'self-test OK' || die "phoenix-dev adopt command routing self-test failed."
+"$ACTIVE" --help | grep -Fq 'phoenix-dev adopt <project-id>' || die "phoenix-dev help does not expose adopt."
 
 status_json="$("$CORE" status)" || {
   docker logs --tail 150 phoenix-dev-agent 2>&1 || true
@@ -208,6 +230,7 @@ docker ps -a --format '{{.ID}}|{{.Image}}|{{.State}}' | while IFS='|' read -r ci
       ;;
   esac
 done
+
 for repo in phoenix-dev-agent phoenix-dev-broker; do
   prev="$(docker images "$repo" --format '{{.Tag}}' | awk -v cur="$VERSION" '$0 != "<none>" && $0 != cur {print; exit}')"
   while IFS= read -r tag; do
@@ -223,3 +246,5 @@ log "Phoenix Dev Agent v$VERSION verified"
 echo "$status_json"
 echo
 echo "Discovery routing: OK"
+echo "Adoption routing: OK"
+echo "Next: phoenix-dev adopt <project-id>"
