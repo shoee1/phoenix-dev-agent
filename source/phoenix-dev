@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euo pipefail
+BASE="${PDA_BASE:-/mnt/user/appdata/phoenix-dev-agent}"
+ENV="$BASE/config/phoenix.env"
+[[ -f "$ENV" ]] || { echo "Phoenix Dev Agent is not installed."; exit 1; }
+set -a; source "$ENV"; set +a
+URL="http://127.0.0.1:${PDA_PORT:-8787}"
+AUTH=(-u "${PDA_ADMIN_USER}:${PDA_ADMIN_PASSWORD}")
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  status) curl -fsS "${AUTH[@]}" "$URL/api/status" | jq . ;;
+  projects) curl -fsS "${AUTH[@]}" "$URL/api/projects" | jq . ;;
+  logs)
+    pid="${1:?project id required}"; curl -fsS "${AUTH[@]}" "$URL/api/projects/$pid/logs?tail=${2:-300}" | jq -r '.combined[]' ;;
+  sweep)
+    pid="${1:?project id required}"; curl -fsS -X POST "${AUTH[@]}" "$URL/api/projects/$pid/sweep" | jq . ;;
+  action)
+    pid="${1:?project id required}"; action="${2:?test|build|deploy|rollback required}"
+    curl -fsS -X POST "${AUTH[@]}" "$URL/api/projects/$pid/action/$action" | jq . ;;
+  codex-login)
+    exec docker exec -it phoenix-dev-agent codex login ;;
+  codex-version|codex-status)
+    curl -fsS "${AUTH[@]}" "$URL/api/codex/version" | jq . ;;
+  credentials)
+    echo "UI: http://$(hostname -I | awk '{print $1}'):${PDA_PORT:-8787}"
+    echo "Username: $PDA_ADMIN_USER"
+    echo "Password: $PDA_ADMIN_PASSWORD"
+    ;;
+  *)
+    cat <<EOF
+Phoenix Dev Agent helper
+
+  $0 status
+  $0 projects
+  $0 logs <project-id> [lines]
+  $0 sweep <project-id>
+  $0 action <project-id> test|build|deploy|rollback
+  $0 codex-login
+  $0 codex-status
+  $0 credentials
+EOF
+  ;;
+esac
