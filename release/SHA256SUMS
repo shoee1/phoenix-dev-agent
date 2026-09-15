@@ -1,7 +1,8 @@
+afba59a3c893b2be571cfb9d9f9adfd90e12f105a0c597506040cca1fce69c34  install-phoenix-dev-agent-v1.3.0-fixed.sh
 e4866e3ec4cc7f9592ebd4414e6d9354879295e38f5fc1340b67ce99d06e6ccd  install-phoenix-dev-agent.sh
 05058ce77643aadf71ff7c1f928e3d10305d5b9026162046200b19d456ddb13c  decoded-concatenated-payload-parts-v1.3.0-base
 3e4f8b38d0aa36cd805d5b98d71252c58299f8c84fc15034de02baf96b19e7f5  features/v1.1.1/phoenix-dev-discover.sh
 6cd2d3daa23f031010624ac1874ff1b9c654cc0cff40dfda16cbdde1f66f33da  features/v1.2.0/phoenix-dev-adopt.sh
-e3a7f844fc363981674678394fcd8d8e101ce223e360914661f1801e534b8d74  features/v1.3.0/phoenix-dev-workflow.sh
+4507a62c9ea348a77fd729cf1beee0b4bfa8d2fea1c5d9e522e51868d9db1e91  features/v1.3.0/phoenix-dev-workflow.sh
 db41a6f348291e2cccb53432018fbadc3cb99c850e244c660ed7a8d66fae0b50  features/v1.3.0/phoenix-dev-wrapper.sh
 11973de5a064a47bdd41b526f65f6aa349e433563805f77147de57f5ffa23ebc  immutable-v1.0.6-base-installer
