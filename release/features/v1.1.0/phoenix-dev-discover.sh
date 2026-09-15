@@ -195,11 +195,9 @@ jq \
   --arg installer "$INSTALLER_PATH" \
   --slurpfile roots "$TMP/roots.json" \
   --slurpfile logs "$TMP/logs.json" \
-  --slurpfile runtime "$TMP/container.json" \
   '.last_discovery = $ts
    | .associated_host_paths = $roots[0]
    | .log_files = $logs[0]
-   | .runtime_snapshot = $runtime[0]
    | .unraid_template_path = (if $template == "" then (.unraid_template_path // null) else $template end)
    | .source_host_path = (if $source == "" then (.source_host_path // null) else $source end)
    | .installer_host_path = (if $installer == "" then (.installer_host_path // null) else $installer end)
