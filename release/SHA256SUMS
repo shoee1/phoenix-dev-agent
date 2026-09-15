@@ -1,2 +1,3 @@
-11973de5a064a47bdd41b526f65f6aa349e433563805f77147de57f5ffa23ebc  install-phoenix-dev-agent.sh
-05058ce77643aadf71ff7c1f928e3d10305d5b9026162046200b19d456ddb13c  decoded-concatenated-payload-parts-v1.0.6
+30fe443786dd1399a722b0cd1394c53a1cbe558faa6d008b9bb5710c7ce2a5d2  install-phoenix-dev-agent.sh
+05058ce77643aadf71ff7c1f928e3d10305d5b9026162046200b19d456ddb13c  decoded-concatenated-payload-parts-v1.0.7-base
+11973de5a064a47bdd41b526f65f6aa349e433563805f77147de57f5ffa23ebc  immutable-v1.0.6-base-installer
