@@ -26,6 +26,8 @@ TMP="$(mktemp -d /tmp/phoenix-discover.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 NOW="$(date -Iseconds)"
 
+# Only the explicitly registered container is inspected. Environment values are
+# never persisted; only variable names are retained.
 docker inspect "$CONTAINER" | jq '.[0] | {
   name: (.Name | ltrimstr("/")),
   image: .Config.Image,
@@ -67,11 +69,15 @@ docker image inspect "$IMAGE_ID" | jq '.[0] | {
   os: .Os
 }' > "$TMP/image.json"
 
+# Build the allowed host search roots only from the registered project's known
+# paths and mounts. Nothing outside these roots is recursively searched.
 {
   jq -r '.mounts[].source // empty' "$TMP/container.json"
   jq -r '.appdata_host_path // empty, .source_host_path // empty, .installer_host_path // empty' "$PROJECT_JSON"
 } | awk 'NF && /^\/mnt\/user\//' | sort -u > "$TMP/roots.raw"
 
+# For appdata submounts, also include their app-level parent (for example
+# /mnt/user/appdata/app/postgres -> /mnt/user/appdata/app).
 while IFS= read -r root; do
   echo "$root"
   case "$root" in
@@ -87,6 +93,7 @@ done > "$TMP/roots.txt"
 
 jq -R -s 'split("\n") | map(select(length > 0))' "$TMP/roots.txt" > "$TMP/roots.json"
 
+# Discover log files only under a mount that is clearly a log mount.
 : > "$TMP/logs.txt"
 jq -r '.mounts[]? | select((.destination == "/logs") or (.source | test("/logs($|/)"))) | .source' "$TMP/container.json" \
   | while IFS= read -r root; do
@@ -95,6 +102,7 @@ jq -r '.mounts[]? | select((.destination == "/logs") or (.source | test("/logs($
     done | sort -u > "$TMP/logs.txt"
 jq -R -s 'split("\n") | map(select(length > 0))' "$TMP/logs.txt" > "$TMP/logs.json"
 
+# Candidate deployment/source files are searched only inside allowed roots.
 : > "$TMP/source_candidates.txt"
 : > "$TMP/installer_candidates.txt"
 : > "$TMP/rollback_candidates.txt"
@@ -114,6 +122,8 @@ for f in source_candidates installer_candidates rollback_candidates; do
   jq -R -s 'split("\n") | map(select(length > 0))' "$TMP/$f.txt" > "$TMP/$f.json"
 done
 
+# Find source-like files inside the registered image/container. This runs only
+# read-only listing commands and does not alter application files.
 if docker exec "$CONTAINER" sh -lc 'true' >/dev/null 2>&1; then
   docker exec "$CONTAINER" sh -lc '
     for d in /app /opt /srv; do
@@ -129,6 +139,8 @@ else
 fi
 jq -R -s 'split("\n") | map(select(length > 0))' "$TMP/image_source_files.txt" > "$TMP/image_source_files.json"
 
+# Locate the Unraid template by the registered container name, but never copy
+# template contents because they can contain credential values.
 TEMPLATE=""
 if [[ -d /boot/config/plugins/dockerMan/templates-user ]]; then
   while IFS= read -r f; do
@@ -141,6 +153,9 @@ fi
 TEMPLATE_SHA=""
 [[ -n "$TEMPLATE" && -f "$TEMPLATE" ]] && TEMPLATE_SHA="$(sha256sum "$TEMPLATE" | awk '{print $1}')"
 
+# Conservative deterministic selection: only auto-fill a source path when a
+# single Dockerfile is present under allowed roots. Installer path is only
+# auto-filled when there is exactly one install/update/deploy script candidate.
 SOURCE_PATH=""
 mapfile -t dockerfiles < <(grep -E '/Dockerfile$' "$TMP/source_candidates.txt" || true)
 if [[ "${#dockerfiles[@]}" -eq 1 ]]; then
@@ -187,6 +202,7 @@ jq -n \
     authority: {test:false, build:false, deploy:false, rollback:false}
   }' > "$PHOENIX_DIR/discovery.json"
 
+# Refresh project metadata without ever enabling deployment authority.
 PROJECT_TMP="$TMP/project.json"
 jq \
   --arg ts "$NOW" \
