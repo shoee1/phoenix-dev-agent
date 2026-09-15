@@ -3,7 +3,7 @@ set -euo pipefail
 
 BASE="${PDA_BASE:-/mnt/user/appdata/phoenix-dev-agent}"
 WORKSPACE="${PDA_WORKSPACE:-/mnt/user/dev/phoenix-projects}"
-VERSION="1.2.0"
+VERSION="1.3.0"
 ACTION="${1:-install}"
 
 GENERIC_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/9966cc18c34743addd2bc3f32f7a9c97ce770dd2/release/install-phoenix-dev-agent.sh"
@@ -12,14 +12,17 @@ DISCOVER_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/fcd2e08
 DISCOVER_SHA256="3e4f8b38d0aa36cd805d5b98d71252c58299f8c84fc15034de02baf96b19e7f5"
 ADOPT_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/9a82890857e82828e1b7cd56cd992ae110f4bd50/release/features/v1.2.0/phoenix-dev-adopt.sh"
 ADOPT_SHA256="6cd2d3daa23f031010624ac1874ff1b9c654cc0cff40dfda16cbdde1f66f33da"
-WRAPPER_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/ea8f13fd5346b6a9fb580f0b68436384c2f926ac/release/features/v1.2.0/phoenix-dev-wrapper.sh"
-WRAPPER_SHA256="a3698866eaa99514ef86aff79164a6d1e68f9836e22895a92629f5a3a2524071"
+WORKFLOW_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/44c20d9b5a477ba51b58e79c47bae2c4d3cc60a6/release/features/v1.3.0/phoenix-dev-workflow.sh"
+WORKFLOW_SHA256="e3a7f844fc363981674678394fcd8d8e101ce223e360914661f1801e534b8d74"
+WRAPPER_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/499f35396119e9209b25e9e3ea8ef01eb1e6fbc0/release/features/v1.3.0/phoenix-dev-wrapper.sh"
+WRAPPER_SHA256="db41a6f348291e2cccb53432018fbadc3cb99c850e244c660ed7a8d66fae0b50"
 
-TMPBASE="$(mktemp /tmp/phoenix-dev-v120-base.XXXXXX.sh)"
-TMPDISC="$(mktemp /tmp/phoenix-dev-v120-discover.XXXXXX.sh)"
-TMPADOPT="$(mktemp /tmp/phoenix-dev-v120-adopt.XXXXXX.sh)"
-TMPWRAP="$(mktemp /tmp/phoenix-dev-v120-wrapper.XXXXXX.sh)"
-trap 'rm -f "$TMPBASE" "$TMPDISC" "$TMPADOPT" "$TMPWRAP"' EXIT
+TMPBASE="$(mktemp /tmp/phoenix-dev-v130-base.XXXXXX.sh)"
+TMPDISC="$(mktemp /tmp/phoenix-dev-v130-discover.XXXXXX.sh)"
+TMPADOPT="$(mktemp /tmp/phoenix-dev-v130-adopt.XXXXXX.sh)"
+TMPFLOW="$(mktemp /tmp/phoenix-dev-v130-workflow.XXXXXX.sh)"
+TMPWRAP="$(mktemp /tmp/phoenix-dev-v130-wrapper.XXXXXX.sh)"
+trap 'rm -f "$TMPBASE" "$TMPDISC" "$TMPADOPT" "$TMPFLOW" "$TMPWRAP"' EXIT
 
 log() { printf '\n==> %s\n' "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -42,16 +45,18 @@ PREVIOUS_AGENT_IMAGE_ID="$(docker inspect -f '{{.Image}}' phoenix-dev-agent 2>/d
 log "Fetching verified Phoenix base installer"
 fetch_verified "$GENERIC_URL" "$GENERIC_SHA256" "$TMPBASE" "Base installer"
 
-log "Fetching verified project onboarding helpers"
+log "Fetching verified project workflow helpers"
 fetch_verified "$DISCOVER_URL" "$DISCOVER_SHA256" "$TMPDISC" "Discovery helper"
 fetch_verified "$ADOPT_URL" "$ADOPT_SHA256" "$TMPADOPT" "Adoption helper"
+fetch_verified "$WORKFLOW_URL" "$WORKFLOW_SHA256" "$TMPFLOW" "Development workflow helper"
 fetch_verified "$WRAPPER_URL" "$WRAPPER_SHA256" "$TMPWRAP" "Command wrapper"
 
-bash -n "$TMPDISC" || die "Discovery helper shell validation failed."
-bash -n "$TMPADOPT" || die "Adoption helper shell validation failed."
-bash -n "$TMPWRAP" || die "Command wrapper shell validation failed."
+for f in "$TMPDISC" "$TMPADOPT" "$TMPFLOW" "$TMPWRAP"; do
+  bash -n "$f" || die "Helper shell validation failed: $f"
+done
 "$TMPDISC" --self-test | grep -Fq 'self-test OK' || die "Discovery helper self-test failed."
 "$TMPADOPT" --self-test | grep -Fq 'self-test OK' || die "Adoption helper self-test failed."
+"$TMPFLOW" --self-test | grep -Fq 'self-test OK' || die "Development workflow self-test failed."
 
 env PDA_RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release}" \
     PDA_PORT="${PDA_PORT:-8787}" \
@@ -69,6 +74,7 @@ ENVFILE="$BASE/config/phoenix.env"
 CORE="$BASE/bin/phoenix-dev-core"
 DISCOVER="$BASE/bin/phoenix-dev-discover"
 ADOPT="$BASE/bin/phoenix-dev-adopt"
+WORKFLOW="$BASE/bin/phoenix-dev-workflow"
 ACTIVE="$BASE/bin/phoenix-dev"
 
 [[ -f "$MAIN" ]] || die "v$VERSION agent source not found at $MAIN"
@@ -83,7 +89,6 @@ docker run --rm -i \
   "phoenix-dev-agent:$VERSION" - /src/main.py <<'PY'
 from pathlib import Path
 import os, sys
-
 p = Path(sys.argv[1])
 s = p.read_text()
 version = os.environ["PDA_RELEASE_VERSION"]
@@ -191,14 +196,16 @@ fi
 cp -f "$HELPER_RUNTIME" "$CORE"
 cp -f "$TMPDISC" "$DISCOVER"
 cp -f "$TMPADOPT" "$ADOPT"
+cp -f "$TMPFLOW" "$WORKFLOW"
 cp -f "$TMPWRAP" "$ACTIVE"
-chmod +x "$CORE" "$DISCOVER" "$ADOPT" "$ACTIVE"
+chmod +x "$CORE" "$DISCOVER" "$ADOPT" "$WORKFLOW" "$ACTIVE"
 ln -sf "$ACTIVE" /usr/local/bin/phoenix-dev 2>/dev/null || true
 
 log "Validating command routing"
-"$ACTIVE" discover --self-test | grep -Fq 'self-test OK' || die "phoenix-dev discover command routing self-test failed."
-"$ACTIVE" adopt --self-test | grep -Fq 'self-test OK' || die "phoenix-dev adopt command routing self-test failed."
-"$ACTIVE" --help | grep -Fq 'phoenix-dev adopt <project-id>' || die "phoenix-dev help does not expose adopt."
+"$ACTIVE" discover --self-test | grep -Fq 'self-test OK' || die "discover routing self-test failed."
+"$ACTIVE" adopt --self-test | grep -Fq 'self-test OK' || die "adopt routing self-test failed."
+"$WORKFLOW" --self-test | grep -Fq 'self-test OK' || die "workflow helper self-test failed."
+"$ACTIVE" --help | grep -Fq 'phoenix-dev deploy <project-id>' || die "phoenix-dev help does not expose development workflow."
 
 status_json="$("$CORE" status)" || {
   docker logs --tail 150 phoenix-dev-agent 2>&1 || true
@@ -211,7 +218,7 @@ echo "$status_json" | grep -Fq "\"version\": \"$VERSION\"" || {
   die "Running agent did not report v$VERSION."
 }
 
-log "Running registered-project discovery validation"
+log "Refreshing registered projects and preparing adopted projects for development"
 shopt -s nullglob
 for pj in "$BASE/projects"/*/project.json; do
   pid="$(jq -r '.id // empty' "$pj")"
@@ -219,6 +226,13 @@ for pj in "$BASE/projects"/*/project.json; do
   echo "--- discover $pid ---"
   "$ACTIVE" discover "$pid" || die "Discovery validation failed for registered project: $pid"
   [[ -s "$WORKSPACE/$pid/.phoenix/discovery.json" ]] || die "Discovery did not create state for registered project: $pid"
+
+  if [[ -s "$WORKSPACE/$pid/.phoenix/adoption.json" ]]; then
+    echo "--- verify $pid ---"
+    "$ACTIVE" verify "$pid" || die "Baseline verification failed for adopted project: $pid"
+    echo "--- build $pid ---"
+    "$ACTIVE" build "$pid" || die "Candidate build verification failed for adopted project: $pid"
+  fi
 done
 shopt -u nullglob
 
@@ -245,6 +259,6 @@ docker image prune -f >/dev/null || true
 log "Phoenix Dev Agent v$VERSION verified"
 echo "$status_json"
 echo
-echo "Discovery routing: OK"
-echo "Adoption routing: OK"
-echo "Next: phoenix-dev adopt <project-id>"
+echo "Project workflow routing: OK"
+echo "Adopted projects: baseline verified and candidate build prepared."
+echo "Next development loop: edit source -> phoenix-dev build <project-id> -> phoenix-dev deploy <project-id>"
