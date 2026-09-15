@@ -3,7 +3,7 @@ set -euo pipefail
 DEFAULT_RELEASE_BASE_URL="https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release"
 BASE="${PDA_RELEASE_BASE_URL:-${1:-}}"
 ACTION="${2:-install}"
-if [[ -z "$BASE" && "$DEFAULT_RELEASE_BASE_URL" != "https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release" ]]; then
+if [[ -z "$BASE" ]]; then
   BASE="$DEFAULT_RELEASE_BASE_URL"
 fi
 [[ -n "$BASE" ]] || { echo "ERROR: No Phoenix release URL configured." >&2; exit 1; }
