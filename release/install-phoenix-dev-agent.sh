@@ -41,6 +41,8 @@ fetch_verified "$WRAPPER_URL" "$WRAPPER_SHA256" "$TMPWRAP" "Command wrapper"
 bash -n "$TMPDISC" || die "Discovery helper shell validation failed."
 bash -n "$TMPWRAP" || die "Command wrapper shell validation failed."
 
+# Stage/build/start through the verified base installer. The stable manifest
+# supplies VERSION=1.1.0 while reusing the verified base payload.
 env PDA_RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release}" \
     PDA_PORT="${PDA_PORT:-8787}" \
     bash "$TMPBASE" "$ACTION"
@@ -74,6 +76,7 @@ p = Path(sys.argv[1])
 s = p.read_text()
 version = os.environ["PDA_RELEASE_VERSION"]
 
+# Accept either the verified base source or an already-patched source.
 if 'APP_VERSION = "1.0.0"' in s:
     s = s.replace('APP_VERSION = "1.0.0"', f'APP_VERSION = "{version}"', 1)
 elif f'APP_VERSION = "{version}"' not in s:
@@ -97,6 +100,7 @@ p.write_text(s)
 print(f"Patched {p}")
 PY
 
+# Parse Python source without generating __pycache__ on the read-only mount.
 docker run --rm \
   -v "$RUNTIME/agent:/src:ro" \
   --entrypoint python \
@@ -108,6 +112,7 @@ grep -Fq "APP_VERSION = \"$VERSION\"" "$MAIN" || die "APP_VERSION verification f
 grep -Fq 'cmd=["codex","exec","--json","--skip-git-repo-check","-C",str(ws)]' "$MAIN" || die "Codex command verification failed."
 grep -Fq 'if full_auto: cmd.extend(["--sandbox","read-only"])' "$MAIN" || die "Codex read-only verification failed."
 
+# Keep headless Codex login usable from the core helper.
 if grep -Fq 'codex-login) exec docker exec -it phoenix-dev-agent codex login ;;' "$HELPER_RUNTIME"; then
   sed -i 's#codex-login) exec docker exec -it phoenix-dev-agent codex login ;;#codex-login) exec docker exec -it phoenix-dev-agent codex login --device-auth ;;#' "$HELPER_RUNTIME"
 fi
@@ -120,6 +125,7 @@ IMAGE_HASH="$(docker run --rm --entrypoint sh "phoenix-dev-agent:$VERSION" -lc '
 [[ "$RUNTIME_HASH" == "$IMAGE_HASH" ]] || die "Built agent image does not contain the patched runtime source."
 
 set -a
+# shellcheck source=/dev/null
 source "$ENVFILE"
 set +a
 PORT="${PDA_PORT:-8787}"
@@ -174,6 +180,8 @@ if [[ "$healthy" -ne 1 ]]; then
   die "Corrected agent health check failed."
 fi
 
+# Preserve the original helper as the core implementation, then layer the
+# project-scoped discovery command in front of it.
 cp -f "$HELPER_RUNTIME" "$CORE"
 cp -f "$TMPDISC" "$DISCOVER"
 cp -f "$TMPWRAP" "$ACTIVE"
@@ -215,6 +223,8 @@ cleanup_old_phoenix() {
   docker image prune -f >/dev/null || true
 }
 
+# Run read-only discovery for projects the user has already explicitly
+# registered. No unregistered Docker containers are enumerated or enrolled.
 log "Refreshing registered project discovery"
 shopt -s nullglob
 for pj in "$BASE/projects"/*/project.json; do
