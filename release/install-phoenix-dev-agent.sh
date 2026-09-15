@@ -13,7 +13,7 @@ trap 'rm -f "$TMP"' EXIT
 log() { printf '\n==> %s\n' "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-for c in docker curl sha256sum awk python3; do
+for c in docker curl sha256sum awk; do
   command -v "$c" >/dev/null 2>&1 || die "$c is required."
 done
 
@@ -43,7 +43,11 @@ ENVFILE="$BASE/config/phoenix.env"
 [[ -f "$ENVFILE" ]] || die "Phoenix environment file not found at $ENVFILE"
 
 log "Applying verified Codex compatibility hotfix for codex-cli 0.154.x"
-PDA_RELEASE_VERSION="$VERSION" python3 - "$MAIN" <<'PY'
+docker run --rm -i \
+  -e "PDA_RELEASE_VERSION=$VERSION" \
+  -v "$RUNTIME/agent:/src:rw" \
+  --entrypoint python \
+  "phoenix-dev-agent:$VERSION" - /src/main.py <<'PY'
 from pathlib import Path
 import os, re, sys
 
@@ -80,7 +84,11 @@ p.write_text(s)
 print(f"Patched {p}")
 PY
 
-python3 -m py_compile "$MAIN" || die "Patched agent source failed Python compilation."
+docker run --rm \
+  -v "$RUNTIME/agent:/src:ro" \
+  --entrypoint python \
+  "phoenix-dev-agent:$VERSION" -m py_compile /src/main.py \
+  || die "Patched agent source failed Python compilation."
 
 echo "===== PATCH VERIFICATION ====="
 grep -n -E 'codex.*exec|full_auto|version.*1\.0\.7' "$MAIN" | head -20 || true
