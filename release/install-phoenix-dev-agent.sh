@@ -38,10 +38,11 @@ require_host() {
 
 resolve_release_base() {
   if [[ -z "$RELEASE_BASE_URL" && -f "$CHANNELFILE" ]]; then
+    # shellcheck source=/dev/null
     source "$CHANNELFILE"
     RELEASE_BASE_URL="${PDA_RELEASE_BASE_URL:-}"
   fi
-  if [[ -z "$RELEASE_BASE_URL" && "$DEFAULT_RELEASE_BASE_URL" != "https://raw.githubusercontent.com/shoee1/phoenix-dev-agent/main/release" ]]; then
+  if [[ -z "$RELEASE_BASE_URL" ]]; then
     RELEASE_BASE_URL="$DEFAULT_RELEASE_BASE_URL"
   fi
   [[ -n "$RELEASE_BASE_URL" ]] || die "No Phoenix release channel is configured. Set PDA_RELEASE_BASE_URL to the hosted release directory."
@@ -53,8 +54,10 @@ load_manifest() {
   local mf
   mf="$(mktemp /tmp/phoenix-dev-manifest.XXXXXX)"
   log "Pulling release manifest"
+  local cache_bust
+  cache_bust="$(date +%s%N 2>/dev/null || date +%s)"
   curl --fail --show-error --location --connect-timeout 15 --retry 3 \
-    "$RELEASE_BASE_URL/latest.env" -o "$mf"
+    "$RELEASE_BASE_URL/latest.env?cb=$cache_bust" -o "$mf"
 
   local key value
   while IFS='=' read -r key value; do
@@ -133,15 +136,53 @@ EOF2
     chmod 600 "$ENVFILE"
   fi
   set -a
+  # shellcheck source=/dev/null
   source "$ENVFILE"
   set +a
   PORT="${PDA_PORT:-$PORT}"
 }
 
+port_busy() {
+  local p="$1"
+  if docker ps --format '{{.Ports}}' 2>/dev/null | grep -Fq ":${p}->"; then return 0; fi
+  if have ss && ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${p}$"; then return 0; fi
+  return 1
+}
+
+agent_owns_port() {
+  local p="$1"
+  docker ps --filter "name=^/${AGENT_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -Fxq "$AGENT_CONTAINER" || return 1
+  docker port "$AGENT_CONTAINER" 8787/tcp 2>/dev/null | grep -Eq ":${p}$"
+}
+
+ensure_ui_port() {
+  if ! port_busy "$PORT" || agent_owns_port "$PORT"; then return 0; fi
+  local old="$PORT" candidate
+  for candidate in $(seq 8788 8899); do
+    if ! port_busy "$candidate"; then
+      PORT="$candidate"
+      export PDA_PORT="$candidate"
+      if grep -q '^PDA_PORT=' "$ENVFILE"; then
+        sed -i "s/^PDA_PORT=.*/PDA_PORT=$candidate/" "$ENVFILE"
+      else
+        printf '\nPDA_PORT=%s\n' "$candidate" >> "$ENVFILE"
+      fi
+      echo "Port $old is already in use; Phoenix Dev Agent will use port $candidate instead."
+      return 0
+    fi
+  done
+  die "No free Phoenix Dev Agent UI port found in 8787-8899."
+}
+
 build_images() {
   log "Building Phoenix Dev Agent $VERSION"
-  docker build --pull -t "$BROKER_IMAGE" "$RUNTIME/broker"
-  docker build --pull -t "$AGENT_IMAGE" "$RUNTIME/agent"
+  docker build --pull --no-cache -t "$BROKER_IMAGE" "$RUNTIME/broker"
+  docker build --pull --no-cache -t "$AGENT_IMAGE" "$RUNTIME/agent"
+
+  log "Verifying built broker image contains Docker CLI"
+  docker run --rm --entrypoint /bin/sh "$BROKER_IMAGE" -lc \
+    'test -x /usr/bin/docker && /usr/bin/docker --version' >/dev/null \
+    || die "Broker image validation failed: Docker CLI is missing or unusable."
 }
 
 remove_stack() {
@@ -204,19 +245,29 @@ install_or_update() {
   ensure_config
   save_channel
 
-  local old_agent="" old_broker=""
+  ensure_ui_port
+
+  local old_agent="" old_broker="" old_healthy=0
   old_agent="$(docker inspect -f '{{.Config.Image}}' "$AGENT_CONTAINER" 2>/dev/null || true)"
   old_broker="$(docker inspect -f '{{.Config.Image}}' "$BROKER_CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$old_agent" && -n "$old_broker" ]] \
+     && [[ "$(docker inspect -f '{{.State.Running}}' "$AGENT_CONTAINER" 2>/dev/null || true)" == "true" ]] \
+     && [[ "$(docker inspect -f '{{.State.Running}}' "$BROKER_CONTAINER" 2>/dev/null || true)" == "true" ]] \
+     && "$BIN" status >/dev/null 2>&1; then
+    old_healthy=1
+  fi
 
   build_images
 
   log "Starting Phoenix Dev Agent v$VERSION"
   remove_stack
   if ! start_stack "$AGENT_IMAGE" "$BROKER_IMAGE"; then
-    if [[ -n "$old_agent" && -n "$old_broker" ]]; then
-      echo "New stack failed to start; restoring previous Phoenix Dev Agent images."
+    if [[ "$old_healthy" -eq 1 ]]; then
+      echo "New stack failed to start; restoring verified healthy previous Phoenix Dev Agent images."
       remove_stack
       start_stack "$old_agent" "$old_broker" || true
+    else
+      echo "No verified healthy previous Phoenix Dev Agent stack is available for rollback."
     fi
     die "Failed to start new Phoenix Dev Agent stack."
   fi
@@ -224,16 +275,32 @@ install_or_update() {
   if ! wait_healthy; then
     echo "Health check failed."
     docker logs --tail 120 "$AGENT_CONTAINER" || true
-    if [[ -n "$old_agent" && -n "$old_broker" ]]; then
-      echo "Rolling Phoenix Dev Agent itself back to the previous images."
+    if [[ "$old_healthy" -eq 1 ]]; then
+      echo "Rolling Phoenix Dev Agent itself back to the verified healthy previous images."
       remove_stack
       start_stack "$old_agent" "$old_broker" || true
+    else
+      echo "No verified healthy previous Phoenix Dev Agent stack is available for rollback."
     fi
     die "Phoenix Dev Agent health check failed."
   fi
 
   log "Validating agent/broker"
-  "$BIN" status >/dev/null || die "Agent/broker validation failed."
+  if ! "$BIN" status >/dev/null; then
+    echo "Agent/broker validation failed. Recent logs follow:"
+    echo "===== AGENT LOG ====="
+    docker logs --tail 150 "$AGENT_CONTAINER" 2>&1 || true
+    echo "===== BROKER LOG ====="
+    docker logs --tail 150 "$BROKER_CONTAINER" 2>&1 || true
+    if [[ "$old_healthy" -eq 1 ]]; then
+      echo "Rolling Phoenix Dev Agent itself back to the verified healthy previous images."
+      remove_stack
+      start_stack "$old_agent" "$old_broker" || true
+    else
+      echo "No verified healthy previous Phoenix Dev Agent stack is available for rollback; failed candidate left running for diagnostics."
+    fi
+    die "Agent/broker validation failed."
+  fi
 
   log "Cleaning orphaned Docker images after successful deployment"
   docker image prune -f >/dev/null || true
