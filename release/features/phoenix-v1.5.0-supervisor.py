@@ -5,7 +5,7 @@ children = []
 remote = None
 remote_restart_at = 0.0
 remote_enabled = os.environ.get("REMOTE_DESKTOP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-remote_home = os.environ.get("REMOTE_DESKTOP_HOME", "/data/desktop-commander/home")
+remote_home = os.environ.get("REMOTE_DESKTOP_HOME", "/mnt/user/appdata/phoenix-dev-agent/desktop-commander-home")
 remote_host_root = os.environ.get("REMOTE_DESKTOP_HOST_ROOT", "/root/host")
 remote_entry = os.environ.get("REMOTE_DESKTOP_ENTRY", "/mnt/user/appdata/phoenix-dev-agent/desktop-commander/node_modules/@wonderwhy-er/desktop-commander/dist/index.js")
 
@@ -67,13 +67,14 @@ def start_remote():
     global remote, remote_restart_at
     if not remote_enabled:
         return
-    identity = Path(remote_home) / ".desktop-commander-device" / "device.json"
+    host_home = Path(remote_host_root) / remote_home.lstrip("/")
+    identity = host_home / ".desktop-commander-device" / "device.json"
+    host_node = Path(remote_host_root) / "usr/local/bin/node"
+    host_entry = Path(remote_host_root) / remote_entry.lstrip("/")
     if not identity.exists():
         print("Remote Desktop Commander identity missing; retrying later", flush=True)
         remote_restart_at = time.time() + 30
         return
-    host_node = Path(remote_host_root) / "usr/local/bin/node"
-    host_entry = Path(remote_host_root) / remote_entry.lstrip("/")
     if not host_node.exists() or not host_entry.exists():
         print("Remote Desktop Commander host runtime missing; retrying later", flush=True)
         remote_restart_at = time.time() + 30
